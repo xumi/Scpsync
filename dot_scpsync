@@ -1,0 +1,8 @@
+{
+  "host": "user@remoteserver.tld",
+  "remote_path": "/var/www/",
+  "ignore": [
+    "^\\.git.*",
+    "^\\.scpsync"
+  ]
+}

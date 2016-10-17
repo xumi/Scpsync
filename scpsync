@@ -1,0 +1,247 @@
+#!/usr/bin/env ruby
+
+# ---------------------------------------------------------
+# General requirements
+# ---------------------------------------------------------
+require 'colorize'
+require 'open3'
+require 'json'
+require 'pathname'
+require 'optparse'
+
+# ---------------------------------------------------------
+# Options
+# ---------------------------------------------------------
+options = {
+  method:   "upload",  # Default direction (local > remote)
+  verbose:  false,     # Print logs
+  brutal:   false,     # Should it perform rm -rf commands?
+  settings: false      # Path of the settings file
+}
+
+# ---------------------------------------------------------
+# Parse Arguments
+# ---------------------------------------------------------
+begin
+  OptionParser.new do |opts|
+    opts.banner = "Usage: scpsync path [options]"
+    opts.on("-v", "--verbose", "Run verbosely") do |v|
+      options[:verbose] = true
+    end
+    opts.on("-d", "-b", "--delete", "--brutal", "Allow remote file AND FOLDER deletion") do |v|
+      options[:brutal] = true
+    end
+    opts.on("-cPATH", "--config=PATH", "Define config file path. Default to an auto-discovery of a .scpsync file") do |v|
+      options[:settings] = v
+    end
+    opts.on("-g", "--get", "Get the remote content instead of sending it") do |v|
+      options[:method] = "download"
+    end
+    opts.on("-h", "--help", "Prints this help") do
+      puts opts
+      exit
+    end
+  end.parse!
+rescue Exception => e
+  puts e
+  exit
+end
+
+# ---------------------------------------------------------
+# Classes
+# ---------------------------------------------------------
+class Manager
+
+  def self.process(path, options)
+    pathname = Pathname.new(Dir.pwd)
+    if options[:settings]
+      # Use the given path
+      settings = Settings.new(options[:settings])
+    else
+      # Auto-discovery of a .scpsync file in the current folder or its parents
+      settings         = Settings.discover(pathname)
+    end
+    unless settings
+      puts "Error: Unable to recursively find .scpsync file".red
+      return false
+    end
+    # We Create a relative path based on the config file path
+    local_path       = path.to_s.gsub(settings.base_path.to_s+'/','')
+    base_remote_path = settings.rules['remote_path']
+    # Add trailing slash if missing
+    base_remote_path = base_remote_path+'/' unless base_remote_path[-1,1] != '/'
+    # Create remote path
+    remote_path      = [base_remote_path,local_path].join
+    remote_path.gsub!('//','/') # Add some path error tolerance
+    # We check if this is a ignored file
+    if settings.is_ignored?(local_path)
+      puts "Ignored: #{local_path}".yellow if options[:verbose]
+      return false
+    end
+
+    # We determine what we'll need to do
+    is_file          = pathname.file?
+    is_directory     = pathname.directory?
+    is_deleted       = !is_file && !is_directory
+
+    # We initiate the transfer
+    transfer         = Transfer.new(settings, remote_path)
+
+    if is_file
+      return transfer.send_file(pathname)
+    elsif is_directory
+      return transfer.create_folder
+    elsif is_deleted
+      if options[:brutal]
+        return transfer.delete_file_or_folder
+      else
+        puts "Not allowed to delete, sorry!".yellow
+        return false
+      end
+    else
+      puts "No idea what to do here, sorry!".yellow
+    end
+    return false
+  end
+
+end
+
+
+class Transfer
+
+  attr_accessor :settings, :remote_path, :action, :is_verbose
+
+  def initialize(settings, remote_path)
+    self.action      = "None"
+    self.settings    = settings
+    self.remote_path = remote_path
+  end
+
+  def send_file(local_path)
+    self.action = __method__
+    begin
+      host          = self.settings.rules['host']
+      user          = self.settings.rules['user'] ? self.settings.rules['user'] : nil
+      credentials   = host
+      credentials   = "#{user}@#{host}" if user
+      command       = "scp #{local_path} #{credentials}:#{self.remote_path}"
+      puts "COPY FILE: #{command}".light_blue if self.settings.rules[:verbose]
+      stdin, stdout, stderr = Open3.popen3(command)
+      error_message = stderr.gets
+      throw error_message if error_message
+      print "[sent]".ljust(10)
+      puts self.remote_path.green
+    rescue Exception => e
+      puts "Unable to transfer the file #{e}".red
+    end
+  end
+
+  def create_folder
+    self.action = __method__
+    begin
+      host          = self.settings.rules['host']
+      user          = self.settings.rules['user'] ? self.settings.rules['user'] : nil
+      credentials   = host
+      credentials   = "#{user}@#{host}" if user
+      command       = "ssh #{credentials} \"mkdir -p #{self.remote_path}\""
+      puts "CREATE FOLDER: #{command}".light_blue if self.settings.rules[:verbose]
+      stdin, stdout, stderr = Open3.popen3(command)
+      error_message = stderr.gets
+      throw error_message if error_message
+      print "[created]".ljust(10)
+      puts self.remote_path.green
+    rescue Exception => e
+      puts "Unable to create folder #{e}".red
+    end
+  end
+
+  def delete_file_or_folder
+    self.action = __method__
+    begin
+      host          = self.settings.rules['host']
+      user          = self.settings.rules['user'] ? self.settings.rules['user'] : nil
+      credentials   = host
+      credentials   = "#{user}@#{host}" if user
+      command       = "ssh #{credentials} \"rm -rf #{self.remote_path}\""
+      puts "DELETE: #{command}".light_blue if self.settings.rules[:verbose]
+      stdin, stdout, stderr = Open3.popen3(command)
+      error_message = stderr.gets
+      throw error_message if error_message
+      print "[deleted]".ljust(10)
+      puts self.remote_path.green
+    rescue Exception => e
+      puts "Unable to delete #{e}".red
+    end
+  end
+
+  def to_s
+    "Transfer: [#{self.action}] #{remote_path}"
+  end
+
+end
+
+class Settings
+  @@file_name = ".scpsync"
+
+  attr_accessor :base_path, :rules
+
+  def initialize(path)
+    self.base_path = Pathname.new(path).parent
+    begin
+      rules_source = File.read(path).chomp("\n")
+      self.rules = JSON.parse(rules_source)
+      self.sanitize!
+    rescue Exception => e
+      puts "Unable to parse JSON config file: #{e}".red
+      exit
+    end
+  end
+
+  def sanitize!
+    if self.rules['remote_path'][-1,1] != '/'
+      self.rules['remote_path'] = self.rules['remote_path'] + '/'
+    end
+  end
+
+  def self.discover(path)
+    config_file_path = nil
+    current_path = path.directory? ? path : path.parent
+    while config_file_path.nil?
+      test_path = (current_path+@@file_name)
+      if test_path.file?
+        return self.new(test_path)
+      elsif current_path.root?
+        return nil
+      else
+        current_path = current_path.parent
+      end
+    end
+  end
+
+  def is_ignored?(path)
+    if self.rules['ignore'] && self.rules['ignore'].is_a?(Array)
+      self.rules['ignore'].each do |ignore_regexp|
+        regexp = Regexp.new(ignore_regexp)
+        # Do nothing if this is an ignored file
+        return true if regexp.match(path.to_s)
+      end
+    end
+    return false
+  end
+
+  def to_s
+    self.rules.to_s
+  end
+
+end
+
+# ---------------------------------------------------------
+# Exec
+# ---------------------------------------------------------
+if ARGV.any?
+  ARGV.each{|path| Manager.process(path.chomp("\n"), options)}
+elsif ARGF.filename != "-" or (not STDIN.tty? and not STDIN.closed?)
+  ARGF.each{|path| Manager.process(path.chomp("\n"), options)}
+else
+  puts "No arguments found."
+end
