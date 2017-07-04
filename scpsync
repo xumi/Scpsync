@@ -238,10 +238,13 @@ end
 # ---------------------------------------------------------
 # Exec
 # ---------------------------------------------------------
-if ARGV.any?
-  ARGV.each{|path| Manager.process(path.chomp("\n"), options)}
-elsif ARGF.filename != "-" or (not STDIN.tty? and not STDIN.closed?)
-  ARGF.each{|path| Manager.process(path.chomp("\n"), options)}
-else
-  puts "No arguments found."
+begin
+  if ARGV.any?
+    ARGV.each{|path| Manager.process(path.chomp("\n"), options)}
+  elsif ARGF.filename != "-" or (not STDIN.tty? and not STDIN.closed?)
+    ARGF.each{|path| Manager.process(path.chomp("\n"), options)}
+  else
+    puts "No arguments found."
+  end
+rescue Interrupt => i
 end
