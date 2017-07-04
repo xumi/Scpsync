@@ -53,7 +53,7 @@ end
 class Manager
 
   def self.process(path, options)
-    pathname = Pathname.new(Dir.pwd)
+    pathname = Pathname.new(path)
     if options[:settings]
       # Use the given path
       settings = Settings.new(options[:settings])
